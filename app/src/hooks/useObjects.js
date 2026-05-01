@@ -1,7 +1,18 @@
 // useObjects.js — estado interpolado de los objetos del slide.
 // El backend envía posiciones ~30fps; aquí interpolamos a 60fps para suavidad.
+//
+// El factor de lerp es ADAPTATIVO según el estado del objeto:
+//   - EN_MANO / FLOTANDO (controlado por la mano en tiempo real) → lerp casi 1.0
+//     para que el objeto siga la mano sin retraso perceptible.
+//   - EN_SLIDE / CONGELADO (en reposo o con inercia física) → lerp moderado
+//     que suaviza la animación de la inercia sin añadir lag.
+// Antes era 0.35 fijo para todo, lo que añadía ~120 ms de lag al arrastre.
 
 import { useEffect, useRef, useState } from 'react';
+
+const LERP_DRAG = 0.9;       // EN_MANO / FLOTANDO: snap a la mano
+const LERP_PHYSICS = 0.6;    // EN_SLIDE / CONGELADO: suaviza inercia
+const EPSILON = 5e-4;        // si la diferencia es menor, copia el target tal cual
 
 export default function useObjects(latestFrame) {
   const [objects, setObjects] = useState([]);
@@ -27,18 +38,25 @@ export default function useObjects(latestFrame) {
           const cur = byId.get(id);
           if (!cur) {
             next.push({ ...tgt });
+            continue;
+          }
+          const lerp = (tgt.estado === 'EN_MANO' || tgt.estado === 'FLOTANDO')
+            ? LERP_DRAG
+            : LERP_PHYSICS;
+          const [tx, ty] = tgt.posicion_actual;
+          const [cx, cy] = cur.posicion_actual;
+          const dx = tx - cx;
+          const dy = ty - cy;
+          const dscale = (tgt.escala || 1) - (cur.escala || 1);
+          // Si ya estamos prácticamente en el target, snap directo y evita
+          // el coste de re-renderizar por diferencias subpíxel.
+          if (Math.abs(dx) < EPSILON && Math.abs(dy) < EPSILON && Math.abs(dscale) < EPSILON) {
+            next.push(tgt);
           } else {
-            // interpolación suave (lerp) hacia el target
-            const lerp = 0.35;
-            const [tx, ty] = tgt.posicion_actual;
-            const [cx, cy] = cur.posicion_actual;
             next.push({
               ...tgt,
-              posicion_actual: [
-                cx + (tx - cx) * lerp,
-                cy + (ty - cy) * lerp,
-              ],
-              escala: cur.escala + (tgt.escala - cur.escala) * lerp,
+              posicion_actual: [cx + dx * lerp, cy + dy * lerp],
+              escala: (cur.escala || 1) + dscale * lerp,
             });
           }
         }

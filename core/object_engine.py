@@ -21,6 +21,7 @@ se encarga de escalarlas al tamaño real del canvas.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -98,6 +99,8 @@ class ObjectEngine:
         friction: float = 0.85,
         magnet_strength: float = 0.15,
         grab_radius: float = 0.10,
+        select_radius: float = 0.15,
+        release_cooldown: float = 0.35,
     ):
         self._objects: Dict[str, Objeto] = {}
         self._active_id: Optional[str] = None
@@ -105,6 +108,16 @@ class ObjectEngine:
         self.friction = friction
         self.magnet_strength = magnet_strength
         self.grab_radius = grab_radius
+        # select_radius es más laxo que grab_radius porque "señalar" admite
+        # menos precisión que "agarrar". El drag (PELLIZCO/etc.) sigue usando
+        # grab_radius * 2.5 para auto-soltar — eso no cambia.
+        self.select_radius = select_radius
+        # Tras soltar un objeto, no permitir que INDICE lo re-seleccione
+        # durante este intervalo. Resuelve el caso "arrastré A cerca de B,
+        # suelto, INDICE re-agarra A en vez de B".
+        self.release_cooldown = release_cooldown
+        self._recent_release_id: Optional[str] = None
+        self._recent_release_t: float = 0.0
 
     # ------------------------------------------------------------------
     # gestión de objetos
@@ -178,17 +191,30 @@ class ObjectEngine:
         if gesto == "INDICE":
             # ÚNICA vía de selección: señalar el objeto con el índice. El
             # resto de gestos no pueden "adoptar" un objeto por proximidad.
-            obj = self._closest_on_slide(hand_xy)
-            if obj is not None and self._distance(obj.posicion_actual, hand_xy) < self.grab_radius:
+            #
+            # Excluimos el objeto recién soltado durante release_cooldown.
+            # Sin esto, si el usuario arrastró A cerca de B y soltó, el
+            # INDICE siguiente se quedaría con A (más cercano) en vez de B.
+            now = time.time()
+            exclude = (
+                self._recent_release_id
+                if (now - self._recent_release_t) < self.release_cooldown
+                else None
+            )
+            obj = self._closest_on_slide(hand_xy, exclude_id=exclude)
+            if obj is not None and self._distance(obj.posicion_actual, hand_xy) < self.select_radius:
                 self._active_id = obj.id
 
         elif gesto == "PELLIZCO":
             # Arrastrar: el objeto activo sigue a la mano (pinzar y mover,
             # como en touch/AR). Sólo si hay objeto seleccionado con INDICE.
+            # speed=1.0 → snap directo a la mano (sin smoothing del backend);
+            # el frontend ya hace lerp suave a 60Hz, así que aquí queremos
+            # entregar el target lo más fresco posible.
             obj = self._get_active_if_nearby(hand_xy)
             if obj is not None:
                 obj.estado = EN_MANO
-                self._move_towards(obj, hand_xy, speed=0.9)
+                self._move_towards(obj, hand_xy, speed=1.0)
 
         elif gesto == "PALMA_ABIERTA":
             # Soltar / liberar: termina la interacción con el objeto activo.
@@ -232,7 +258,7 @@ class ObjectEngine:
                 if self._distance(obj.posicion_actual, hand_xy) > self.grab_radius * 2.5:
                     if obj.estado in (EN_MANO, FLOTANDO):
                         obj.estado = EN_SLIDE
-                    self._active_id = None
+                    self._mark_released()
 
     # ------------------------------------------------------------------
     # navegación de slides
@@ -305,6 +331,19 @@ class ObjectEngine:
         cx, cy = obj.posicion_actual
         obj.velocidad = ((ox - cx) * 4.0, (oy - cy) * 4.0)
         obj.estado = EN_SLIDE
+        self._mark_released()
+
+    def _mark_released(self) -> None:
+        """Limpia el activo y arma el cooldown anti-reseleccion para ese id.
+
+        Cualquier ruta de "soltar" debe pasar por aquí: PALMA_ABIERTA,
+        EMPUJE, auto-release por distancia, toggle de pausa. Así el
+        siguiente INDICE no podrá re-agarrar el mismo objeto durante
+        release_cooldown segundos.
+        """
+        if self._active_id is not None:
+            self._recent_release_id = self._active_id
+            self._recent_release_t = time.time()
         self._active_id = None
 
     def deselect(self) -> None:
@@ -316,7 +355,7 @@ class ObjectEngine:
         if obj.estado in (EN_MANO, FLOTANDO):
             obj.estado = EN_SLIDE
         obj.velocidad = (0.0, 0.0)
-        self._active_id = None
+        self._mark_released()
 
     def reset_all(self) -> None:
         """Vuelve todos los objetos a su posición original (botón R)."""
@@ -335,12 +374,21 @@ class ObjectEngine:
     def _distance(self, a: Tuple[float, float], b: Tuple[float, float]) -> float:
         return float(np.hypot(a[0] - b[0], a[1] - b[1]))
 
-    def _closest_on_slide(self, xy: Tuple[float, float]) -> Optional[Objeto]:
+    def _closest_on_slide(
+        self,
+        xy: Tuple[float, float],
+        exclude_id: Optional[str] = None,
+    ) -> Optional[Objeto]:
         objs = self.on_slide(self._current_slide)
+        if exclude_id is not None:
+            objs = [o for o in objs if o.id != exclude_id]
         if not objs:
             return None
-        # prioriza mayor z_index en caso de empate
-        objs.sort(key=lambda o: (-o.z_index, self._distance(o.posicion_actual, xy)))
+        # Distancia primero (criterio natural al "señalar"); el z_index sólo
+        # rompe empates cuando dos objetos están casi superpuestos. Antes el
+        # sort era (-z_index, distancia) y un objeto con z_index alto podía
+        # ganar aunque la mano estuviera lejos.
+        objs.sort(key=lambda o: (self._distance(o.posicion_actual, xy), -o.z_index))
         return objs[0]
 
     def _get_active_if_nearby(self, xy: Tuple[float, float]) -> Optional[Objeto]:
@@ -358,7 +406,7 @@ class ObjectEngine:
             # Mano se alejó demasiado → liberar y volver a EN_SLIDE.
             if obj.estado in (EN_MANO, FLOTANDO):
                 obj.estado = EN_SLIDE
-            self._active_id = None
+            self._mark_released()
             return None
         return obj
 

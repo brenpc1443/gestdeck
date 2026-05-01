@@ -124,3 +124,10 @@ $RECYCLE.BIN/
 *.tar.gz
 *.7z
 *.rar
+
+# ---- Documentos de exposición / entregables académicos (no van al repo) ----
+*.docx
+*.doc
+*.pdf
+docs/FUNDAMENTO_TECNICO.md
+docs/_md_to_docx.py

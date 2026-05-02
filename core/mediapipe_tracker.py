@@ -120,14 +120,44 @@ class TrackingResult:
     detections_per_frame: int = 0
 
     def dominant(self, dominant: str) -> Optional[HandLandmarks]:
+        """Compat: asume frame mirroreado (mirror=True). Usar `for_user`
+        cuando se conozca el mirror real del frame."""
         if dominant.lower().startswith("r"):
             return self.right_hand
         return self.left_hand
 
     def support(self, dominant: str) -> Optional[HandLandmarks]:
+        """Compat: ver `dominant`. Usar `for_user` para resultados correctos."""
         if dominant.lower().startswith("r"):
             return self.left_hand
         return self.right_hand
+
+    def for_user(
+        self,
+        user_dominance: str,
+        mirror: bool,
+    ) -> tuple[Optional[HandLandmarks], Optional[HandLandmarks]]:
+        """Devuelve (mano_dominante, mano_apoyo) según la posición real
+        en el frame y la configuración de mirror.
+
+        El tracker slotea por x (left_hand=baja x, right_hand=alta x).
+        Bajo mirror=True el usuario se ve "como en un espejo" → su mano
+        derecha física está a alta x → right_hand slot. Bajo mirror=False
+        el frame está al revés → la derecha física está a baja x →
+        left_hand slot.
+
+        Tabla:
+            mirror=True,  derecha    → dom=right_hand, sup=left_hand
+            mirror=True,  izquierda  → dom=left_hand,  sup=right_hand
+            mirror=False, derecha    → dom=left_hand,  sup=right_hand
+            mirror=False, izquierda  → dom=right_hand, sup=left_hand
+        """
+        is_right = user_dominance.lower().startswith("r") or user_dominance.lower().startswith("d")
+        # XNOR: dom va al slot de "alta x" cuando is_right==mirror
+        dom_high_x = (is_right and mirror) or (not is_right and not mirror)
+        if dom_high_x:
+            return self.right_hand, self.left_hand
+        return self.left_hand, self.right_hand
 
 
 class Tracker:
@@ -136,15 +166,23 @@ class Tracker:
     def __init__(
         self,
         min_detection_confidence: float = 0.6,
-        min_tracking_confidence: float = 0.5,
+        min_tracking_confidence: float = 0.65,
         model_complexity: int = 1,       # mantenido por compatibilidad de API
         process_every_n: int = 2,        # 1 de cada N frames
+        mirror: bool = True,             # frame espejado (default en GestDeck)
     ):
         del model_complexity  # el nuevo API usa un solo asset
+        # Flag mutable: main.py lo sincroniza con camera.config.mirror cuando
+        # cambia. La asignación de slots por handedness depende de él.
+        self.mirror = mirror
         model_path = ensure_model()
         options = HolisticLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(model_path)),
             running_mode=RunningMode.VIDEO,
+            # Subido a 0.65 para que MP no devuelva landmarks de baja
+            # confianza cuando hay ambigüedad (dedos hacia cámara, manos
+            # ocluyendo, motion blur). Preferimos "no hay mano" a
+            # "landmarks en lugares imposibles".
             min_hand_landmarks_confidence=min_tracking_confidence,
             min_pose_detection_confidence=min_detection_confidence,
             min_pose_suppression_threshold=0.3,
@@ -158,6 +196,39 @@ class Tracker:
         self._last_result: Optional[TrackingResult] = None
         self._epoch = time.time()
         self._last_ts_ms = -1
+        # Estabilización de identidad: posición del palm_center de cada
+        # slot en el frame anterior. Evita que MediaPipe intercambie las
+        # etiquetas L/R cuando las manos están cerca o los dedos apuntan
+        # a la cámara (la identidad la decidimos por continuidad espacial,
+        # no por la etiqueta de MP que es inestable).
+        self._last_left_palm: Optional[np.ndarray] = None
+        self._last_right_palm: Optional[np.ndarray] = None
+        self._gap_left: int = 0
+        self._gap_right: int = 0
+        # Tras este número de frames sin ver una mano, descartamos su última
+        # posición. ~0.4s a 30 FPS efectivos del tracker.
+        self._max_gap_frames: int = 12
+        # Bridging: cuando MP pierde una mano hasta `_bridge_max` frames
+        # consecutivos, devolvemos los últimos landmarks válidos en vez
+        # de None. Enmascara los micro-cortes (dedos al frente, pellizco
+        # apretado, motion blur) sin ocultar pérdidas reales (>130ms).
+        self._last_left_hand: Optional[HandLandmarks] = None
+        self._last_right_hand: Optional[HandLandmarks] = None
+        self._bridge_max: int = 4
+        # Solo bridgear un slot si tuvo al menos `_bridge_min_streak` frames
+        # reales consecutivos antes de perderse. Sin esto, una detección
+        # phantom de un solo frame (MP confundiendo un brazo con mano)
+        # generaría un fantasma que persiste 130 ms.
+        self._bridge_min_streak: int = 2
+        self._eligible_bridge_left: bool = False
+        self._eligible_bridge_right: bool = False
+        self._streak_left: int = 0
+        self._streak_right: int = 0
+        # Span máximo permitido para wrist→MCP medio (en coords normalizadas
+        # del frame). Una mano a distancia normal ocupa 5-10% del frame; al
+        # acercarla deliberadamente a la cámara puede ocupar hasta ~45%. Por
+        # encima de 0.5 ya casi siempre es un brazo o el cuerpo.
+        self._max_hand_span: float = 0.5
 
     def close(self) -> None:
         try:
@@ -203,19 +274,177 @@ class Tracker:
         pose = _first_hand(getattr(res, "pose_landmarks", None))
 
         if lh is not None:
-            result.left_hand = HandLandmarks(points=_lm_to_array(lh, dim=3), handedness="Left")
+            cand = HandLandmarks(points=_lm_to_array(lh, dim=3), handedness="Left")
+            if self._is_plausible_hand(cand):
+                result.left_hand = cand
         if rh is not None:
-            result.right_hand = HandLandmarks(points=_lm_to_array(rh, dim=3), handedness="Right")
+            cand = HandLandmarks(points=_lm_to_array(rh, dim=3), handedness="Right")
+            if self._is_plausible_hand(cand):
+                result.right_hand = cand
         if pose is not None:
             result.pose_landmarks = _lm_to_array(pose, dim=4)
 
-        result.any_hand = result.left_hand is not None or result.right_hand is not None
-        result.detections_per_frame = sum(
-            x is not None for x in (result.left_hand, result.right_hand)
+        # --- Estabilización de identidad ---------------------------------
+        # Asignamos cada detección al slot del tracker usando la handedness
+        # ANATÓMICA que MP reporta + el flag mirror del frame. Esto evita
+        # que una mano nueva entrante sea adoptada por el slot de la mano
+        # anterior cuando ambas están en posiciones similares (bug típico
+        # al cambiar de dominante a apoyo rápidamente).
+        left_real, right_real = self._stabilize_identity(
+            result.left_hand, result.right_hand,
         )
+
+        # --- Bridging de huecos cortos -----------------------------------
+        # Si un slot quedó vacío pero ese mismo slot tenía mano hace pocos
+        # frames Y tenía una racha real consistente (≥_bridge_min_streak),
+        # reusamos los últimos landmarks válidos. La condición de racha
+        # filtra phantoms de un solo frame que generaban manos fantasma
+        # estiradas. Lo importante es que `_update_palm_trackers` reciba
+        # el estado REAL (no el bridged), para que el contador de gap
+        # avance y eventualmente el bridge expire cuando la mano se haya
+        # ido de verdad.
+        left_out = left_real
+        right_out = right_real
+        if (
+            left_real is None
+            and self._last_left_hand is not None
+            and self._gap_left < self._bridge_max
+            and self._eligible_bridge_left
+        ):
+            left_out = self._last_left_hand
+        if (
+            right_real is None
+            and self._last_right_hand is not None
+            and self._gap_right < self._bridge_max
+            and self._eligible_bridge_right
+        ):
+            right_out = self._last_right_hand
+
+        result.left_hand = left_out
+        result.right_hand = right_out
+        result.any_hand = left_out is not None or right_out is not None
+        result.detections_per_frame = sum(
+            x is not None for x in (left_out, right_out)
+        )
+        self._update_palm_trackers(left_real, right_real)
+        # Cache de landmarks para bridging — sólo cuando MP los devolvió
+        # de verdad (no propagar bridges sobre bridges).
+        if left_real is not None:
+            self._last_left_hand = left_real
+        if right_real is not None:
+            self._last_right_hand = right_real
 
         self._last_result = result
         return result
+
+    # ------------------------------------------------------------------
+    def _stabilize_identity(
+        self,
+        lh: Optional[HandLandmarks],
+        rh: Optional[HandLandmarks],
+    ) -> tuple[Optional[HandLandmarks], Optional[HandLandmarks]]:
+        """Asigna detecciones a los slots del tracker (left_hand=baja x,
+        right_hand=alta x) usando la handedness ANATÓMICA que reporta
+        MediaPipe (`left_hand_landmarks` vs `right_hand_landmarks`),
+        corregida por el flag `mirror` del frame.
+
+        Cuando el frame está espejado (mirror=True), la chirality de MP se
+        invierte respecto al usuario: la mano que MP llama "Left" es en
+        realidad la mano DERECHA física del usuario (que aparece a alta x
+        en el frame mostrado), y viceversa. Sin mirror, anatómica y posición
+        coinciden directamente.
+
+        Tabla de mapeo (handedness MP → slot tracker):
+            mirror=True : MP "Left" → slot right_hand (alta x);
+                          MP "Right" → slot left_hand (baja x).
+            mirror=False: MP "Left" → slot left_hand (baja x);
+                          MP "Right" → slot right_hand (alta x).
+
+        Identificar las manos por anatomía (no por proximidad al último
+        palm visto) evita que una mano nueva entrante sea adoptada por el
+        slot vacío de la mano que se acaba de retirar — bug que aparecía al
+        cambiar de dominante a apoyo rápidamente.
+
+        Defensa contra glitches de chirality (manos juntas, dedos a cámara):
+        si MP da ambas manos pero sus posiciones x contradicen claramente
+        la convención esperada por mirror, asumimos que MP confundió las
+        etiquetas y las swappeamos.
+        """
+        if lh is None and rh is None:
+            return None, None
+
+        # Detección de chirality swappeada por MP (caso raro): si tenemos
+        # ambas manos, sus posiciones x deberían estar ordenadas según el
+        # mirror. Si no, MP se confundió → corregir.
+        if lh is not None and rh is not None:
+            lh_x = float(lh.palm_center[0])
+            rh_x = float(rh.palm_center[0])
+            if self.mirror and lh_x < rh_x:
+                # Espejado: MP "Left" debería estar a mayor x. Swap.
+                lh, rh = rh, lh
+            elif not self.mirror and lh_x > rh_x:
+                # Sin espejo: MP "Left" debería estar a menor x. Swap.
+                lh, rh = rh, lh
+
+        # Mapeo handedness → slot del tracker.
+        if self.mirror:
+            return rh, lh
+        return lh, rh
+
+    def _update_palm_trackers(
+        self,
+        left: Optional[HandLandmarks],
+        right: Optional[HandLandmarks],
+    ) -> None:
+        """Actualiza la posición conocida de cada slot, su racha de
+        detecciones reales consecutivas y la elegibilidad para bridging.
+
+        - Tras max_gap_frames sin ver una mano, su última posición se
+          olvida (slot libre).
+        - La elegibilidad para bridge se enciende cuando la racha llega
+          a _bridge_min_streak. Permanece encendida durante el gap y se
+          reevalúa cuando el slot vuelve a tener detección.
+        """
+        # left
+        if left is not None:
+            if self._gap_left > 0:
+                # Transición de gap a real: la racha empieza de cero
+                self._streak_left = 0
+            self._streak_left += 1
+            self._gap_left = 0
+            self._eligible_bridge_left = self._streak_left >= self._bridge_min_streak
+            self._last_left_palm = left.palm_center.copy()
+        else:
+            self._gap_left += 1
+            if self._gap_left > self._max_gap_frames:
+                self._last_left_palm = None
+                self._eligible_bridge_left = False
+        # right
+        if right is not None:
+            if self._gap_right > 0:
+                self._streak_right = 0
+            self._streak_right += 1
+            self._gap_right = 0
+            self._eligible_bridge_right = self._streak_right >= self._bridge_min_streak
+            self._last_right_palm = right.palm_center.copy()
+        else:
+            self._gap_right += 1
+            if self._gap_right > self._max_gap_frames:
+                self._last_right_palm = None
+                self._eligible_bridge_right = False
+
+    def _is_plausible_hand(self, hand: HandLandmarks) -> bool:
+        """Filtro de sanidad: rechaza landmarks claramente erróneos.
+
+        Cuando MediaPipe confunde un brazo, el cuerpo o un objeto con
+        forma de mano, devuelve landmarks "estirados": la distancia
+        wrist→MCP medio supera con creces el tamaño normal de una mano.
+        Una mano humana a distancia razonable de la cámara ocupa 5-10%
+        del frame; >25% es chatarra y debe descartarse antes de slottear.
+        """
+        p = hand.points[:, :2]
+        span = float(np.linalg.norm(p[9] - p[0]))  # wrist (0) → MCP medio (9)
+        return 0.01 < span < self._max_hand_span
 
 
 # ----------------------------------------------------------------------

@@ -61,7 +61,7 @@ class GestDeckBackend:
 
         # Componentes
         self.camera = Camera(CameraConfig(mirror=True, apply_clahe=True))
-        self.tracker = Tracker(process_every_n=2)
+        self.tracker = Tracker(process_every_n=2, mirror=self.camera.config.mirror)
         self.mapper = VirtualMapper(MapperConfig(mode="identity"))
         self.engine = ObjectEngine()
         self.ws = WebSocketServer(
@@ -105,8 +105,11 @@ class GestDeckBackend:
         self._perception_thread: Optional[threading.Thread] = None
         self._calibrating = False
         self._calibration_samples: list = []
-        self._cooldown_next = 0.0
-        self._cooldown_prev = 0.0
+        # Anti-rebote único para navegación de slides. La detección es por
+        # FLANCO (cambio de gesto), pero un cooldown corto evita que una
+        # oscilación SIGUIENTE↔NINGUNO del LSTM dispare dos veces seguidas.
+        self._cooldown_nav = 0.0
+        self._prev_nav_gesture: str = ""
         self._camera_ok = False
         self._camera_error: Optional[str] = None
         # Cuando está activo, _broadcast añade landmarks al payload para que
@@ -261,8 +264,13 @@ class GestDeckBackend:
                 last_t = now
 
                 tracking = self.tracker.process(frame)
-                dominant_hand = tracking.dominant(self.dominant)
-                support_hand = tracking.support(self.dominant)
+                # for_user mapea (dominance, mirror) → slots por POSICIÓN x
+                # del frame, ignorando la etiqueta L/R de MediaPipe (que se
+                # invierte con mirror y causaba que la mano dominante física
+                # fuera tratada como apoyo).
+                dominant_hand, support_hand = tracking.for_user(
+                    self.dominant, self.camera.config.mirror,
+                )
 
                 hand_xy: Optional[tuple] = None
                 if dominant_hand is not None:
@@ -302,13 +310,20 @@ class GestDeckBackend:
                     self.engine.deselect()
                 self._prev_pause_gesture = pause_now
 
+                # Navegación por FLANCO: solo dispara cuando el gesto aparece
+                # (transición desde otro estado), no mientras se sostenga.
+                # Sostener SIGUIENTE no debe avanzar slide tras slide.
+                nav = pred_sup.gesto
+                nav_edge = nav != self._prev_nav_gesture
                 now_nav = time.time()
-                if pred_sup.gesto == "SIGUIENTE" and now_nav > self._cooldown_next:
-                    self._cooldown_next = now_nav + 1.2
-                    self._go_to_slide(self.engine.current_slide + 1)
-                elif pred_sup.gesto == "ANTERIOR" and now_nav > self._cooldown_prev:
-                    self._cooldown_prev = now_nav + 1.2
-                    self._go_to_slide(self.engine.current_slide - 1)
+                if nav_edge and now_nav > self._cooldown_nav:
+                    if nav == "SIGUIENTE":
+                        self._cooldown_nav = now_nav + 0.5
+                        self._go_to_slide(self.engine.current_slide + 1)
+                    elif nav == "ANTERIOR":
+                        self._cooldown_nav = now_nav + 0.5
+                        self._go_to_slide(self.engine.current_slide - 1)
+                self._prev_nav_gesture = nav
 
                 # --- Mano dominante: objetos (bloqueado si PAUSA) ------
                 if not self._paused:
@@ -507,7 +522,10 @@ class GestDeckBackend:
         self.engine.scale(oid, float(msg.get("escala", 1.0)))
 
     def _on_set_mirror(self, msg):
-        self.camera.config.mirror = bool(msg.get("value", True))
+        v = bool(msg.get("value", True))
+        self.camera.config.mirror = v
+        # El tracker usa mirror para decidir el sloteo por handedness anatómica.
+        self.tracker.mirror = v
 
     def _on_set_mano_dominante(self, msg):
         v = str(msg.get("value", "derecha")).lower()

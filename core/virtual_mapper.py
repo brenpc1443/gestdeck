@@ -34,15 +34,25 @@ import numpy as np
 
 @dataclass
 class MapperConfig:
-    mode: str = "identity"                  # "identity" | "zoom" | "calibrated"
+    mode: str = "identity"                  # "identity" | "zoom" | "calibrated" | "adaptive"
     active_region: Tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     # (x0, y0, x1, y1) en coordenadas normalizadas de la cámara.
-    # Solo se usa en modo 'zoom' y 'calibrated'.
+    # Solo se usa en modo 'zoom', 'calibrated' y 'adaptive' (en este último
+    # se actualiza dinámicamente según el span aparente de la mano).
     corners_camera: Optional[list] = None   # [[x,y], x4] — usado en 'calibrated'
     sensitivity: float = 1.0                # multiplicador de rango
     invert_y: bool = False                  # si tu cámara está al revés
     min_clamp: float = -0.1                 # permite un poco fuera del slide para suavidad
     max_clamp: float = 1.1
+    # --- Modo adaptive ----------------------------------------------------
+    # Span aparente de la mano (||wrist → MCP_medio|| en coords del frame)
+    # de referencia para los extremos de distancia. La región activa se
+    # interpola entre estos dos puntos según el span observado en runtime.
+    adaptive_span_far: float = 0.04         # mano lejos → ocupa ~4% del frame
+    adaptive_span_near: float = 0.15        # mano cerca → ocupa ~15%+ del frame
+    adaptive_margin_far: float = 0.28       # margen lateral cuando lejos (región [0.28, 0.72])
+    adaptive_margin_near: float = 0.08      # margen lateral cuando cerca (región [0.08, 0.92])
+    adaptive_ema_alpha: float = 0.08        # suavizado del span observado (0=congelado, 1=sin filtro)
 
 
 class VirtualMapper:
@@ -51,8 +61,19 @@ class VirtualMapper:
     def __init__(self, config: Optional[MapperConfig] = None):
         self.config = config or MapperConfig()
         self._homography: Optional[np.ndarray] = None
+        # Estado del modo adaptive: span suavizado por EMA. None = sin
+        # historia todavía; el primer frame válido lo inicializa directo
+        # para evitar un transitorio largo desde 0.
+        self._adaptive_span_ema: Optional[float] = None
         if self.config.mode == "calibrated" and self.config.corners_camera is not None:
             self._build_homography()
+        if self.config.mode == "adaptive":
+            # Arrancamos con la región media (margen entre near y far) para
+            # que el primer frame tenga un mapeo razonable antes de recibir
+            # `update_from_hand_span`.
+            self._set_active_region_from_margin(
+                (self.config.adaptive_margin_far + self.config.adaptive_margin_near) / 2.0
+            )
 
     # ------------------------------------------------------------------
     # API pública
@@ -61,7 +82,9 @@ class VirtualMapper:
         """Mapea un punto de la cámara (x, y) ∈ [0,1] al espacio del slide."""
         if self.config.mode == "identity":
             sx, sy = x, y
-        elif self.config.mode == "zoom":
+        elif self.config.mode in ("zoom", "adaptive"):
+            # 'adaptive' usa el mismo stretch que 'zoom'; la diferencia es
+            # que `active_region` se actualiza vía `update_from_hand_span`.
             sx, sy = self._map_zoom(x, y)
         elif self.config.mode == "calibrated":
             sx, sy = self._map_homography(x, y)
@@ -87,6 +110,53 @@ class VirtualMapper:
         for i, (x, y, _z) in enumerate(hand_points):
             out[i] = self.map_point(float(x), float(y))
         return out
+
+    # ------------------------------------------------------------------
+    # Modo adaptive: ajusta la región activa según la distancia de la mano
+    # ------------------------------------------------------------------
+    def update_from_hand_span(self, span: float) -> None:
+        """Ajusta `active_region` según el span aparente de la mano.
+
+        `span` es la distancia normalizada wrist→MCP_medio en coordenadas
+        del frame. Cuando la mano está cerca de la cámara ocupa más espacio
+        (span grande) → el usuario tiene rango amplio en el frame y podemos
+        usar una región activa amplia. Cuando está lejos (span pequeño) →
+        rango efectivo limitado, región más estrecha y centrada para que
+        el alcance lateral siga cubriendo todo el slide sin que el usuario
+        tenga que estirarse.
+
+        Suavizamos con un EMA para evitar saltos cuando la mano cambia de
+        gesto (PUNO_CERRADO encoge el span; PALMA lo expande). Si el modo
+        no es 'adaptive' esta llamada no hace nada.
+        """
+        if self.config.mode != "adaptive":
+            return
+        if span is None or span <= 0:
+            return
+
+        # EMA del span observado.
+        a = float(self.config.adaptive_ema_alpha)
+        if self._adaptive_span_ema is None:
+            self._adaptive_span_ema = float(span)
+        else:
+            self._adaptive_span_ema = (1 - a) * self._adaptive_span_ema + a * float(span)
+
+        # Lerp del margen entre los extremos near/far. t=0 → far, t=1 → near.
+        s_far = float(self.config.adaptive_span_far)
+        s_near = float(self.config.adaptive_span_near)
+        denom = max(1e-6, s_near - s_far)
+        t = (self._adaptive_span_ema - s_far) / denom
+        t = max(0.0, min(1.0, t))
+        margin = (
+            self.config.adaptive_margin_far * (1 - t)
+            + self.config.adaptive_margin_near * t
+        )
+        self._set_active_region_from_margin(float(margin))
+
+    def _set_active_region_from_margin(self, margin: float) -> None:
+        """Construye una región activa centrada con el margen lateral dado."""
+        margin = max(0.0, min(0.49, margin))
+        self.config.active_region = (margin, margin, 1.0 - margin, 1.0 - margin)
 
     # ------------------------------------------------------------------
     # Calibración en caliente (estilo "párate en el centro" simplificado)

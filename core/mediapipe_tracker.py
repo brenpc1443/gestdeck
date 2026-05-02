@@ -120,42 +120,40 @@ class TrackingResult:
     detections_per_frame: int = 0
 
     def dominant(self, dominant: str) -> Optional[HandLandmarks]:
-        """Compat: asume frame mirroreado (mirror=True). Usar `for_user`
-        cuando se conozca el mirror real del frame."""
-        if dominant.lower().startswith("r"):
-            return self.right_hand
-        return self.left_hand
+        """Compat (asume mirror=True). Usa `for_user` para casos generales."""
+        return self.for_user(dominant, mirror=True)[0]
 
     def support(self, dominant: str) -> Optional[HandLandmarks]:
-        """Compat: ver `dominant`. Usar `for_user` para resultados correctos."""
-        if dominant.lower().startswith("r"):
-            return self.left_hand
-        return self.right_hand
+        """Compat (asume mirror=True). Usa `for_user` para casos generales."""
+        return self.for_user(dominant, mirror=True)[1]
 
     def for_user(
         self,
         user_dominance: str,
         mirror: bool,
     ) -> tuple[Optional[HandLandmarks], Optional[HandLandmarks]]:
-        """Devuelve (mano_dominante, mano_apoyo) según la posición real
-        en el frame y la configuración de mirror.
+        """Devuelve (mano_dominante, mano_apoyo).
 
-        El tracker slotea por x (left_hand=baja x, right_hand=alta x).
-        Bajo mirror=True el usuario se ve "como en un espejo" → su mano
-        derecha física está a alta x → right_hand slot. Bajo mirror=False
-        el frame está al revés → la derecha física está a baja x →
-        left_hand slot.
+        Los slots `left_hand` y `right_hand` corresponden a la handedness
+        anatómica que reporta MediaPipe sobre la imagen RECIBIDA. Cuando el
+        frame está espejado (mirror=True), la chirality reportada por MP
+        queda invertida respecto al usuario: la mano DERECHA física aparece
+        a la derecha del frame mostrado, y MP — analizando la imagen tal
+        cual — la etiqueta como "Left" (porque para el modelo el cuerpo
+        que ve está espejado). Por eso bajo mirror la dominante diestra
+        cae en el slot `left_hand`.
 
-        Tabla:
-            mirror=True,  derecha    → dom=right_hand, sup=left_hand
-            mirror=True,  izquierda  → dom=left_hand,  sup=right_hand
-            mirror=False, derecha    → dom=left_hand,  sup=right_hand
-            mirror=False, izquierda  → dom=right_hand, sup=left_hand
+        Tabla efectiva (`is_right XOR mirror` → slot de la dominante):
+            mirror=True,  derecha    → dom=left_hand,  sup=right_hand
+            mirror=True,  izquierda  → dom=right_hand, sup=left_hand
+            mirror=False, derecha    → dom=right_hand, sup=left_hand
+            mirror=False, izquierda  → dom=left_hand,  sup=right_hand
         """
         is_right = user_dominance.lower().startswith("r") or user_dominance.lower().startswith("d")
-        # XNOR: dom va al slot de "alta x" cuando is_right==mirror
-        dom_high_x = (is_right and mirror) or (not is_right and not mirror)
-        if dom_high_x:
+        # XOR: dom va al slot right_hand cuando exactamente uno de los dos
+        # (is_right, mirror) es True.
+        dom_in_right_slot = is_right ^ mirror
+        if dom_in_right_slot:
             return self.right_hand, self.left_hand
         return self.left_hand, self.right_hand
 
@@ -169,12 +167,8 @@ class Tracker:
         min_tracking_confidence: float = 0.65,
         model_complexity: int = 1,       # mantenido por compatibilidad de API
         process_every_n: int = 2,        # 1 de cada N frames
-        mirror: bool = True,             # frame espejado (default en GestDeck)
     ):
         del model_complexity  # el nuevo API usa un solo asset
-        # Flag mutable: main.py lo sincroniza con camera.config.mirror cuando
-        # cambia. La asignación de slots por handedness depende de él.
-        self.mirror = mirror
         model_path = ensure_model()
         options = HolisticLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(model_path)),
@@ -343,52 +337,24 @@ class Tracker:
         lh: Optional[HandLandmarks],
         rh: Optional[HandLandmarks],
     ) -> tuple[Optional[HandLandmarks], Optional[HandLandmarks]]:
-        """Asigna detecciones a los slots del tracker (left_hand=baja x,
-        right_hand=alta x) usando la handedness ANATÓMICA que reporta
-        MediaPipe (`left_hand_landmarks` vs `right_hand_landmarks`),
-        corregida por el flag `mirror` del frame.
+        """Passthrough de la handedness anatómica de MediaPipe.
 
-        Cuando el frame está espejado (mirror=True), la chirality de MP se
-        invierte respecto al usuario: la mano que MP llama "Left" es en
-        realidad la mano DERECHA física del usuario (que aparece a alta x
-        en el frame mostrado), y viceversa. Sin mirror, anatómica y posición
-        coinciden directamente.
+        MediaPipe Holistic determina handedness a partir de la pose corporal
+        (qué brazo se conecta a cada mano). Eso identifica de forma estable
+        cuál es la mano izquierda física del usuario y cuál la derecha,
+        independientemente de:
+        - el flag mirror del frame,
+        - la posición x donde aparezcan,
+        - cambios rápidos de mano (la nueva entra con su propia etiqueta
+          anatómica, no hereda el slot vacío de la otra),
+        - gestos que cruzan el centro del frame (la mano mantiene su
+          identidad durante todo el swipe / empuje).
 
-        Tabla de mapeo (handedness MP → slot tracker):
-            mirror=True : MP "Left" → slot right_hand (alta x);
-                          MP "Right" → slot left_hand (baja x).
-            mirror=False: MP "Left" → slot left_hand (baja x);
-                          MP "Right" → slot right_hand (alta x).
-
-        Identificar las manos por anatomía (no por proximidad al último
-        palm visto) evita que una mano nueva entrante sea adoptada por el
-        slot vacío de la mano que se acaba de retirar — bug que aparecía al
-        cambiar de dominante a apoyo rápidamente.
-
-        Defensa contra glitches de chirality (manos juntas, dedos a cámara):
-        si MP da ambas manos pero sus posiciones x contradicen claramente
-        la convención esperada por mirror, asumimos que MP confundió las
-        etiquetas y las swappeamos.
+        Por eso asignamos directo: `left_hand_landmarks` (MP "Left") al slot
+        `left_hand` del tracker, `right_hand_landmarks` (MP "Right") al
+        `right_hand`. La convención del tracker pasa de "por x" a "por
+        anatomía"; `for_user` ya no necesita el flag mirror para traducir.
         """
-        if lh is None and rh is None:
-            return None, None
-
-        # Detección de chirality swappeada por MP (caso raro): si tenemos
-        # ambas manos, sus posiciones x deberían estar ordenadas según el
-        # mirror. Si no, MP se confundió → corregir.
-        if lh is not None and rh is not None:
-            lh_x = float(lh.palm_center[0])
-            rh_x = float(rh.palm_center[0])
-            if self.mirror and lh_x < rh_x:
-                # Espejado: MP "Left" debería estar a mayor x. Swap.
-                lh, rh = rh, lh
-            elif not self.mirror and lh_x > rh_x:
-                # Sin espejo: MP "Left" debería estar a menor x. Swap.
-                lh, rh = rh, lh
-
-        # Mapeo handedness → slot del tracker.
-        if self.mirror:
-            return rh, lh
         return lh, rh
 
     def _update_palm_trackers(

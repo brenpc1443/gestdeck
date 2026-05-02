@@ -95,6 +95,14 @@ export default function Training() {
         break;
       case 'dataset_stats':
         if (lastEvent.stats) setStatsPorMano(lastEvent.stats);
+        // Defensa: si el `training_ready` inicial se perdió, las clases
+        // pueden venir aquí también. Solo sobreescribimos si vienen.
+        if (lastEvent.clases_dominant || lastEvent.clases_support) {
+          setClasesPorMano({
+            dominant: lastEvent.clases_dominant || [],
+            support:  lastEvent.clases_support  || [],
+          });
+        }
         break;
       case 'sample_saved':
         if (lastEvent.stats) setStatsPorMano(lastEvent.stats);
@@ -192,7 +200,12 @@ export default function Training() {
     send({ tipo: 'save_sample', mano, clase: gestoActual });
   };
 
-  const handleWrong = () => setPicker({ mode: 'correct' });
+  const handleWrong = () => {
+    // Si las clases aún no llegaron del backend (race con `training_ready`),
+    // pedimos un refresh sincrónico al abrir el picker para que se popule.
+    if (!clases.length) send({ tipo: 'dataset_stats' });
+    setPicker({ mode: 'correct' });
+  };
 
   const handleRecord = () => {
     // Cuenta regresiva 3-2-1 visual, luego graba 1 segundo con barra de
@@ -551,18 +564,25 @@ function ClassPicker({ title, clases, onPick, onCancel }) {
             onClick={onCancel}
           >Cancelar</button>
         </div>
-        <div className="grid grid-cols-3 gap-3">
-          {clases.map((c) => (
-            <button
-              key={c}
-              className="bg-gd-bg border border-gd-soft hover:border-gd-accent hover:bg-gd-soft/40 rounded-xl p-4 flex flex-col items-center gap-2 transition"
-              onClick={() => onPick(c)}
-            >
-              <span className="text-4xl">{CLASS_ICONS[c] || '❔'}</span>
-              <span className="text-sm">{CLASS_LABELS[c] || c}</span>
-            </button>
-          ))}
-        </div>
+        {clases.length === 0 ? (
+          <div className="text-sm text-amber-400 py-8 text-center">
+            Cargando clases del backend… si esto persiste, vuelve atrás y
+            entra de nuevo a Entrenamiento.
+          </div>
+        ) : (
+          <div className="grid grid-cols-3 gap-3">
+            {clases.map((c) => (
+              <button
+                key={c}
+                className="bg-gd-bg border border-gd-soft hover:border-gd-accent hover:bg-gd-soft/40 rounded-xl p-4 flex flex-col items-center gap-2 transition"
+                onClick={() => onPick(c)}
+              >
+                <span className="text-4xl">{CLASS_ICONS[c] || '❔'}</span>
+                <span className="text-sm">{CLASS_LABELS[c] || c}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

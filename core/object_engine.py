@@ -317,10 +317,21 @@ class ObjectEngine:
                 )
 
     def _release_if_needed(self) -> None:
-        # Si no hay mano visible, los objetos EN_MANO se congelan
-        for obj in self._objects.values():
-            if obj.estado == EN_MANO:
-                obj.estado = CONGELADO
+        """Sin mano visible: soltar el objeto activo limpio y liberar el slot.
+
+        Antes los EN_MANO pasaban a CONGELADO pero `_active_id` se mantenía,
+        dejando el motor en un estado del que el usuario no podía salir:
+        al volver la mano e intentar seleccionar otro objeto con INDICE,
+        el activo viejo seguía colgado y bloqueaba el flujo. Ahora soltamos
+        en EN_SLIDE en su última posición y armamos el cooldown anti-
+        reseleccion para que el siguiente INDICE pueda elegir libremente.
+        """
+        if self._active_id and self._active_id in self._objects:
+            obj = self._objects[self._active_id]
+            if obj.estado in (EN_MANO, FLOTANDO):
+                obj.estado = EN_SLIDE
+                obj.velocidad = (0.0, 0.0)
+            self._mark_released()
 
     def _release_to_origin(self) -> None:
         if self._active_id is None:

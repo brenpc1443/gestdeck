@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 from core.camera import Camera, CameraConfig
 from core.mediapipe_tracker import Tracker
 from core.virtual_mapper import VirtualMapper, MapperConfig
@@ -61,8 +63,13 @@ class GestDeckBackend:
 
         # Componentes
         self.camera = Camera(CameraConfig(mirror=True, apply_clahe=True))
-        self.tracker = Tracker(process_every_n=2, mirror=self.camera.config.mirror)
-        self.mapper = VirtualMapper(MapperConfig(mode="identity"))
+        self.tracker = Tracker(process_every_n=2)
+        # Modo adaptive: la región activa de la cámara se ajusta sola al
+        # span aparente de la mano (proxy de distancia a la cámara). Eso
+        # permite que la mano alcance los bordes del slide sin salirse del
+        # encuadre, tanto presentando cerca como lejos. Si la sesión carga
+        # una calibración manual (`load_session`), ese mapper la sobreescribe.
+        self.mapper = VirtualMapper(MapperConfig(mode="adaptive"))
         self.engine = ObjectEngine()
         self.ws = WebSocketServer(
             on_message=self._on_message,
@@ -275,9 +282,15 @@ class GestDeckBackend:
                 hand_xy: Optional[tuple] = None
                 if dominant_hand is not None:
                     self.classifier_dom.push_frame(dominant_hand.flat_xy())
+                    # Span aparente de la mano (wrist→MCP_medio en coords del
+                    # frame): el mapper adaptive lo usa para inferir distancia
+                    # a la cámara y ajustar la región activa.
+                    pts = dominant_hand.points
+                    span = float(np.linalg.norm(pts[9, :2] - pts[0, :2]))
+                    self.mapper.update_from_hand_span(span)
                     palm = dominant_hand.palm_center
                     hand_xy = self.mapper.map_point(float(palm[0]), float(palm[1]))
-                    self._last_dominant_points = dominant_hand.points
+                    self._last_dominant_points = pts
                     if self._calibrating:
                         self._calibration_samples.append((float(palm[0]), float(palm[1])))
                 else:
@@ -522,10 +535,7 @@ class GestDeckBackend:
         self.engine.scale(oid, float(msg.get("escala", 1.0)))
 
     def _on_set_mirror(self, msg):
-        v = bool(msg.get("value", True))
-        self.camera.config.mirror = v
-        # El tracker usa mirror para decidir el sloteo por handedness anatómica.
-        self.tracker.mirror = v
+        self.camera.config.mirror = bool(msg.get("value", True))
 
     def _on_set_mano_dominante(self, msg):
         v = str(msg.get("value", "derecha")).lower()
@@ -603,9 +613,14 @@ class GestDeckBackend:
         })
 
     def _on_dataset_stats(self, _msg):
+        # Reenviamos también las clases entrenables — es la red de seguridad
+        # por si el evento `training_ready` se perdió en el camino (race con
+        # el setLastEvent de useWebSocket que sólo guarda el último evento).
         self.ws.send({
             "tipo": "dataset_stats",
             "stats": self._build_stats(),
+            "clases_dominant": list(CLASES_ENTRENABLES_DOM),
+            "clases_support": list(CLASES_ENTRENABLES_SUP),
         })
 
     def _on_retrain(self, msg):
@@ -660,7 +675,6 @@ class GestDeckBackend:
 
     # ==================================================================
     def _finish_calibration(self) -> None:
-        import numpy as np
         self._calibrating = False
         if len(self._calibration_samples) >= 10:
             self.mapper.calibrate_from_samples(

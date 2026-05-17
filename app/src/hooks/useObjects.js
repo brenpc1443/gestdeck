@@ -4,14 +4,13 @@
 // El factor de lerp es ADAPTATIVO según el estado del objeto:
 //   - EN_MANO / FLOTANDO (controlado por la mano en tiempo real) → lerp casi 1.0
 //     para que el objeto siga la mano sin retraso perceptible.
-//   - EN_SLIDE / CONGELADO (en reposo o con inercia física) → lerp moderado
+//   - EN_SLIDE (en reposo o con inercia física) → lerp moderado
 //     que suaviza la animación de la inercia sin añadir lag.
-// Antes era 0.35 fijo para todo, lo que añadía ~120 ms de lag al arrastre.
 
 import { useEffect, useRef, useState } from 'react';
 
 const LERP_DRAG = 0.9;       // EN_MANO / FLOTANDO: snap a la mano
-const LERP_PHYSICS = 0.6;    // EN_SLIDE / CONGELADO: suaviza inercia
+const LERP_PHYSICS = 0.6;    // EN_SLIDE: suaviza inercia
 const EPSILON = 5e-4;        // si la diferencia es menor, copia el target tal cual
 
 export default function useObjects(latestFrame) {

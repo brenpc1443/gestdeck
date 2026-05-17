@@ -13,7 +13,7 @@ Mapeo de gestos → acción (mano dominante):
   - PUNO_CERRADO: achica (zoom out).
   - EMPUJE:       devuelve al origen con inercia.
 
-Estados: EN_SLIDE, EN_MANO, FLOTANDO, CONGELADO.
+Estados: EN_SLIDE, EN_MANO, FLOTANDO.
 
 Las coordenadas están en [0, 1] × [0, 1] dentro del slide — el frontend
 se encarga de escalarlas al tamaño real del canvas.
@@ -32,7 +32,6 @@ import numpy as np
 EN_SLIDE = "EN_SLIDE"
 EN_MANO = "EN_MANO"
 FLOTANDO = "FLOTANDO"
-CONGELADO = "CONGELADO"
 
 
 @dataclass
@@ -317,15 +316,7 @@ class ObjectEngine:
                 )
 
     def _release_if_needed(self) -> None:
-        """Sin mano visible: soltar el objeto activo limpio y liberar el slot.
-
-        Antes los EN_MANO pasaban a CONGELADO pero `_active_id` se mantenía,
-        dejando el motor en un estado del que el usuario no podía salir:
-        al volver la mano e intentar seleccionar otro objeto con INDICE,
-        el activo viejo seguía colgado y bloqueaba el flujo. Ahora soltamos
-        en EN_SLIDE en su última posición y armamos el cooldown anti-
-        reseleccion para que el siguiente INDICE pueda elegir libremente.
-        """
+        """Sin mano visible: soltar el objeto activo en EN_SLIDE y liberar el slot."""
         if self._active_id and self._active_id in self._objects:
             obj = self._objects[self._active_id]
             if obj.estado in (EN_MANO, FLOTANDO):

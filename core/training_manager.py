@@ -162,7 +162,15 @@ class TrainingManager:
             if not clase_dir.exists():
                 continue
             files = sorted(clase_dir.glob("*.npy"))
-            if not files:
+            # Una clase con menos del mínimo no entra al training: el split
+            # estratificado se rompe y degrada al resto del modelo. Mejor
+            # ignorarla por completo hasta que el usuario grabe suficientes.
+            if len(files) < MIN_MUESTRAS_POR_CLASE:
+                if files:
+                    print(
+                        f"[training:{self.nombre}] Ignorando clase '{clase}' "
+                        f"({len(files)} muestras < mínimo {MIN_MUESTRAS_POR_CLASE})."
+                    )
                 continue
             label_idx = len(labels)
             labels.append(clase)

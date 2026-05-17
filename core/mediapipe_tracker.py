@@ -119,14 +119,6 @@ class TrackingResult:
     any_hand: bool = False
     detections_per_frame: int = 0
 
-    def dominant(self, dominant: str) -> Optional[HandLandmarks]:
-        """Compat (asume mirror=True). Usa `for_user` para casos generales."""
-        return self.for_user(dominant, mirror=True)[0]
-
-    def support(self, dominant: str) -> Optional[HandLandmarks]:
-        """Compat (asume mirror=True). Usa `for_user` para casos generales."""
-        return self.for_user(dominant, mirror=True)[1]
-
     def for_user(
         self,
         user_dominance: str,
@@ -223,6 +215,11 @@ class Tracker:
         # acercarla deliberadamente a la cámara puede ocupar hasta ~45%. Por
         # encima de 0.5 ya casi siempre es un brazo o el cuerpo.
         self._max_hand_span: float = 0.5
+        # Distancia (en fracción de frame) bajo la cual consideramos que las
+        # detecciones left/right son la MISMA mano duplicada por MP. ~5%
+        # del frame es más que el ruido típico de palm_center pero menos que
+        # la separación de dos manos juntas haciendo gestos.
+        self._duplicate_distance: float = 0.06
 
     def close(self) -> None:
         try:
@@ -277,6 +274,20 @@ class Tracker:
                 result.right_hand = cand
         if pose is not None:
             result.pose_landmarks = _lm_to_array(pose, dim=4)
+
+        # --- Filtro de mano fantasma duplicada ---------------------------
+        # Cuando solo hay una mano real visible, MediaPipe a veces emite
+        # landmarks tanto en `left_hand` como en `right_hand` para la misma
+        # mano (la "rellena" en el otro slot por contexto de pose). Si los
+        # palm_centers están casi solapados, descartamos la fantasma usando
+        # la pose corporal (`LEFT_WRIST`=15, `RIGHT_WRIST`=16) como
+        # arbitraje: la detección que cuadre con su muñeca anatómica se
+        # queda; la otra es fantasma. Sin pose, descartamos la que esté
+        # más cerca del centro horizontal del frame (probable hallucination
+        # del cuerpo).
+        result.left_hand, result.right_hand = self._reject_phantom_duplicate(
+            result.left_hand, result.right_hand, result.pose_landmarks,
+        )
 
         # --- Estabilización de identidad ---------------------------------
         # Asignamos cada detección al slot del tracker usando la handedness
@@ -398,6 +409,41 @@ class Tracker:
             if self._gap_right > self._max_gap_frames:
                 self._last_right_palm = None
                 self._eligible_bridge_right = False
+
+    def _reject_phantom_duplicate(
+        self,
+        lh: Optional[HandLandmarks],
+        rh: Optional[HandLandmarks],
+        pose: Optional[np.ndarray],
+    ) -> tuple[Optional[HandLandmarks], Optional[HandLandmarks]]:
+        """Si lh y rh están casi solapadas, descartar la fantasma."""
+        if lh is None or rh is None:
+            return lh, rh
+        d = float(np.linalg.norm(lh.palm_center[:2] - rh.palm_center[:2]))
+        if d > self._duplicate_distance:
+            return lh, rh
+        # Arbitraje por pose si está disponible y es lo suficientemente visible.
+        # Pose landmark 15 = LEFT_WRIST anatómica, 16 = RIGHT_WRIST anatómica.
+        if pose is not None and len(pose) > 16:
+            lw = pose[15, :2]
+            rw = pose[16, :2]
+            lw_vis = float(pose[15, 3]) if pose.shape[1] > 3 else 1.0
+            rw_vis = float(pose[16, 3]) if pose.shape[1] > 3 else 1.0
+            if lw_vis > 0.5 and rw_vis > 0.5:
+                lh_w = lh.points[0, :2]
+                rh_w = rh.points[0, :2]
+                # Cada slot debería estar más cerca de SU muñeca anatómica.
+                lh_score = np.linalg.norm(lh_w - lw)
+                rh_score = np.linalg.norm(rh_w - rw)
+                if lh_score < rh_score:
+                    return lh, None
+                return None, rh
+        # Sin pose útil: descartar la más cercana al centro horizontal del
+        # frame (es la que más probablemente la "imaginó" MP a partir del
+        # cuerpo, no la mano real que está a un lado).
+        if abs(lh.palm_center[0] - 0.5) < abs(rh.palm_center[0] - 0.5):
+            return None, rh
+        return lh, None
 
     def _is_plausible_hand(self, hand: HandLandmarks) -> bool:
         """Filtro de sanidad: rechaza landmarks claramente erróneos.

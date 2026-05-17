@@ -17,7 +17,6 @@ Python → Electron
 Electron → Python
     { "tipo": "reiniciar" }
     { "tipo": "cambiar_slide", "slide": int }
-    { "tipo": "iniciar_calibracion" }
     { "tipo": "finalizar" }
     { "tipo": "cargar_sesion", "path": str }
     { "tipo": "set_mirror", "value": bool }

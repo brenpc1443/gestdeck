@@ -8,7 +8,6 @@ import React from 'react';
 const STATE_HALO = {
   EN_MANO:   'drop-shadow(0 0 16px rgba(57,160,255,0.95))',
   FLOTANDO:  'drop-shadow(0 0 18px rgba(170,120,255,0.85))',
-  CONGELADO: 'drop-shadow(0 0 10px rgba(255,90,90,0.55))',
   EN_SLIDE:  'none',
 };
 

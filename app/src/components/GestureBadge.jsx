@@ -11,6 +11,7 @@ const COLORS = {
   EMPUJE: 'bg-fuchsia-500/80',
   SIGUIENTE: 'bg-indigo-500/80',
   ANTERIOR: 'bg-indigo-500/80',
+  PAUSA: 'bg-rose-500/80',
   NINGUNO: 'bg-gray-600/70',
 };
 

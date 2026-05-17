@@ -61,11 +61,30 @@ export default function Control() {
         />
       </div>
 
+      {lastFrame?.paused && (
+        <div className="bg-rose-600/90 text-white text-sm font-semibold rounded-md px-3 py-2 flex items-center gap-2 animate-pulse">
+          <span>⏸</span>
+          <span>PAUSADO</span>
+          <span className="text-xs font-normal opacity-80">
+            (la mano de apoyo activó PAUSA — los gestos sobre objetos están bloqueados)
+          </span>
+        </div>
+      )}
+
       <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-xs text-white/50 w-12">dom</span>
         <GestureBadge
           gesto={lastFrame?.gesto}
           confianza={lastFrame?.confianza}
           fuente={lastFrame?.fuente}
+        />
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-xs text-white/50 w-12">apoyo</span>
+        <GestureBadge
+          gesto={lastFrame?.gesto_apoyo}
+          confianza={lastFrame?.confianza_apoyo}
+          fuente={lastFrame?.fuente_apoyo}
         />
         <div className="text-xs text-white/70">
           FPS: {lastFrame?.camera_fps ?? '—'} &nbsp;|&nbsp;

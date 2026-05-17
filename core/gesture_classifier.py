@@ -6,7 +6,7 @@ Dos modos disponibles:
 1. LSTM (principal, Deep Learning)
    - Recibe una secuencia de N=30 frames de 42 features (21 landmarks x,y
      aplanados) y devuelve la clase de gesto + confianza.
-   - Carga core/models/gestures_model.h5 entrenado por el propio usuario.
+   - Carga el .h5 indicado por `model_path` (uno por mano, dominante/apoyo).
 
 2. Rule-based (fallback)
    - Si no existe modelo entrenado, usa heurísticas geométricas simples
@@ -56,8 +56,8 @@ class GestureClassifier:
 
     def __init__(
         self,
-        model_path: str | Path = "core/models/gestures_model.h5",
-        labels_path: str | Path = "core/models/gestures_labels.json",
+        model_path: str | Path,
+        labels_path: str | Path,
         use_rules: bool = True,
         nombre: str = "classifier",
     ):
@@ -341,7 +341,10 @@ class GestureClassifier:
 # Smoke test
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    clf = GestureClassifier()
+    clf = GestureClassifier(
+        model_path="core/models/gestures_model_dominant.h5",
+        labels_path="core/models/gestures_labels_dominant.json",
+    )
     # simular mano con todos los dedos extendidos
     dummy = np.zeros((21, 3), dtype=np.float32)
     dummy[:, 0] = np.linspace(0, 1, 21)

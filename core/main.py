@@ -10,7 +10,6 @@ Inicia 4 hilos paralelos (adaptado al modo fantasma: no hay ArUco):
 Maneja los siguientes mensajes entrantes de Electron:
     reiniciar
     cambiar_slide
-    iniciar_calibracion
     finalizar
     cargar_sesion
     guardar_sesion
@@ -110,8 +109,6 @@ class GestDeckBackend:
         # Estado interno
         self._running = False
         self._perception_thread: Optional[threading.Thread] = None
-        self._calibrating = False
-        self._calibration_samples: list = []
         # Anti-rebote único para navegación de slides. La detección es por
         # FLANCO (cambio de gesto), pero un cooldown corto evita que una
         # oscilación SIGUIENTE↔NINGUNO del LSTM dispare dos veces seguidas.
@@ -291,8 +288,6 @@ class GestDeckBackend:
                     palm = dominant_hand.palm_center
                     hand_xy = self.mapper.map_point(float(palm[0]), float(palm[1]))
                     self._last_dominant_points = pts
-                    if self._calibrating:
-                        self._calibration_samples.append((float(palm[0]), float(palm[1])))
                 else:
                     self.classifier_dom.push_frame(None)
                     self._last_dominant_points = None
@@ -460,12 +455,6 @@ class GestDeckBackend:
         s = int(msg.get("slide", 1))
         self.engine.change_slide(s, carrying=False)
         self.ws.send({"tipo": "cambio_slide", "slide": s})
-
-    def _on_iniciar_calibracion(self, _msg):
-        self._calibrating = True
-        self._calibration_samples.clear()
-        threading.Timer(3.0, self._finish_calibration).start()
-        self.ws.send({"tipo": "calibracion_en_curso"})
 
     def _on_finalizar(self, _msg):
         self.stop()
@@ -672,18 +661,6 @@ class GestDeckBackend:
             "fuente": self.classifier_dom.source,
             "fuente_apoyo": self.classifier_sup.source,
         })
-
-    # ==================================================================
-    def _finish_calibration(self) -> None:
-        self._calibrating = False
-        if len(self._calibration_samples) >= 10:
-            self.mapper.calibrate_from_samples(
-                np.array(self._calibration_samples, dtype=np.float32))
-            self.ws.send({"tipo": "calibracion_ok",
-                          "active_region": list(self.mapper.config.active_region)})
-        else:
-            self.ws.send({"tipo": "calibracion_fallida"})
-
 
 # ----------------------------------------------------------------------
 def main():

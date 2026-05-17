@@ -419,12 +419,6 @@ export default function Editor() {
             ▶ Iniciar presentación
           </button>
           <button
-            className="bg-gd-soft hover:bg-gd-soft/70 rounded-lg py-2 text-sm"
-            onClick={() => send({ tipo: 'iniciar_calibracion' })}
-          >
-            Calibrar área de gestos (3s)
-          </button>
-          <button
             className="bg-gd-soft/60 hover:bg-gd-soft/40 rounded-lg py-2 text-sm"
             onClick={() => send({ tipo: 'reiniciar' })}
           >
@@ -454,6 +448,12 @@ export default function Editor() {
             >›</button>
           </div>
           <div className="flex items-center gap-2">
+            {lastFrame?.paused && (
+              <div className="bg-rose-600/90 text-white text-xs font-semibold rounded-md px-2.5 py-1 flex items-center gap-1.5 animate-pulse">
+                <span>⏸</span>
+                <span>PAUSADO</span>
+              </div>
+            )}
             <button
               className="bg-gd-soft hover:bg-gd-soft/70 rounded-lg px-3 py-1.5 text-sm flex items-center gap-1.5"
               onClick={() => { window.location.hash = '/training'; }}
@@ -465,6 +465,11 @@ export default function Editor() {
               gesto={lastFrame?.gesto}
               confianza={lastFrame?.confianza}
               fuente={lastFrame?.fuente}
+            />
+            <GestureBadge
+              gesto={lastFrame?.gesto_apoyo}
+              confianza={lastFrame?.confianza_apoyo}
+              fuente={lastFrame?.fuente_apoyo}
             />
           </div>
         </header>

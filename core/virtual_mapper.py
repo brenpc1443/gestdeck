@@ -1,31 +1,30 @@
 """
-virtual_mapper.py — Mapeo directo cámara → slide en Modo Virtual.
+virtual_mapper.py — Mapeo cámara → slide en Modo Virtual.
 
-Reemplaza al aruco_mapper.py del diseño original. Como en modo virtual
-no hay proyector físico, las coordenadas normalizadas de MediaPipe
-(ya en [0, 1]) se mapean DIRECTAMENTE al espacio del slide con un
-ajuste simple:
+En modo virtual no hay proyector físico: las coordenadas normalizadas que
+entrega MediaPipe (ya en [0, 1]) se mapean al espacio del slide ajustando
+una "región activa" del frame que se estira a las dimensiones del slide.
 
-    1. Opción 'identidad'  — x_slide = x_cam, y_slide = y_cam.
-       Útil cuando la cámara enmarca al presentador frontalmente.
+Hay dos modos:
 
-    2. Opción 'zoom'       — recorta una sub-región de la cámara como
-       el "área activa" y la re-normaliza a [0, 1]. Esto permite usar
-       solo la zona donde el presentador gesticula (p.ej. el cuadrante
-       central) y duplica la sensibilidad.
+    1. 'identity'  — passthrough x_slide = x_cam, y_slide = y_cam.
+       Útil cuando la cámara enmarca al presentador frontalmente y el
+       usuario quiere control 1:1.
 
-    3. Opción 'calibrada'  — el presentador define 4 puntos de la
-       cámara (esquinas del área activa) en una calibración rápida
-       de 3 segundos. Se aplica una transformación afín/perspectiva.
+    2. 'adaptive'  — la región activa se ajusta sola al span aparente
+       de la mano (proxy de distancia a la cámara). Mano lejos → región
+       estrecha y centrada para que el alcance lateral cubra todo el
+       slide; mano cerca → región amplia. Es el modo por defecto: el
+       usuario no necesita calibrar nada.
 
-En todos los casos la salida es (x, y) ∈ [0, 1] × [0, 1] con origen
-en la esquina superior izquierda del slide.
+En ambos casos la salida es (x, y) ∈ [0, 1] × [0, 1] con origen en la
+esquina superior izquierda del slide.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -34,12 +33,10 @@ import numpy as np
 
 @dataclass
 class MapperConfig:
-    mode: str = "identity"                  # "identity" | "zoom" | "calibrated" | "adaptive"
+    mode: str = "adaptive"                  # "identity" | "adaptive"
     active_region: Tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
-    # (x0, y0, x1, y1) en coordenadas normalizadas de la cámara.
-    # Solo se usa en modo 'zoom', 'calibrated' y 'adaptive' (en este último
-    # se actualiza dinámicamente según el span aparente de la mano).
-    corners_camera: Optional[list] = None   # [[x,y], x4] — usado en 'calibrated'
+    # (x0, y0, x1, y1) en coordenadas normalizadas de la cámara. En modo
+    # 'adaptive' se actualiza dinámicamente según el span aparente de la mano.
     sensitivity: float = 1.0                # multiplicador de rango
     invert_y: bool = False                  # si tu cámara está al revés
     min_clamp: float = -0.1                 # permite un poco fuera del slide para suavidad
@@ -60,13 +57,10 @@ class VirtualMapper:
 
     def __init__(self, config: Optional[MapperConfig] = None):
         self.config = config or MapperConfig()
-        self._homography: Optional[np.ndarray] = None
         # Estado del modo adaptive: span suavizado por EMA. None = sin
         # historia todavía; el primer frame válido lo inicializa directo
         # para evitar un transitorio largo desde 0.
         self._adaptive_span_ema: Optional[float] = None
-        if self.config.mode == "calibrated" and self.config.corners_camera is not None:
-            self._build_homography()
         if self.config.mode == "adaptive":
             # Arrancamos con la región media (margen entre near y far) para
             # que el primer frame tenga un mapeo razonable antes de recibir
@@ -82,12 +76,8 @@ class VirtualMapper:
         """Mapea un punto de la cámara (x, y) ∈ [0,1] al espacio del slide."""
         if self.config.mode == "identity":
             sx, sy = x, y
-        elif self.config.mode in ("zoom", "adaptive"):
-            # 'adaptive' usa el mismo stretch que 'zoom'; la diferencia es
-            # que `active_region` se actualiza vía `update_from_hand_span`.
+        elif self.config.mode == "adaptive":
             sx, sy = self._map_zoom(x, y)
-        elif self.config.mode == "calibrated":
-            sx, sy = self._map_homography(x, y)
         else:
             raise ValueError(f"Modo desconocido: {self.config.mode}")
 
@@ -159,48 +149,26 @@ class VirtualMapper:
         self.config.active_region = (margin, margin, 1.0 - margin, 1.0 - margin)
 
     # ------------------------------------------------------------------
-    # Calibración en caliente (estilo "párate en el centro" simplificado)
-    # ------------------------------------------------------------------
-    def calibrate_from_samples(self, samples: np.ndarray) -> None:
-        """Dada una nube de puntos (N, 2) recogida mientras el usuario
-        'barre' su área de gestos, ajusta active_region para que encaje.
-
-        samples: coordenadas de la cámara normalizadas [0, 1].
-        """
-        if len(samples) < 10:
-            return
-        x0 = float(np.percentile(samples[:, 0], 5))
-        x1 = float(np.percentile(samples[:, 0], 95))
-        y0 = float(np.percentile(samples[:, 1], 5))
-        y1 = float(np.percentile(samples[:, 1], 95))
-        # Expandir un 10% para dar margen
-        dx, dy = (x1 - x0) * 0.1, (y1 - y0) * 0.1
-        self.config.active_region = (
-            max(0.0, x0 - dx),
-            max(0.0, y0 - dy),
-            min(1.0, x1 + dx),
-            min(1.0, y1 + dy),
-        )
-        self.config.mode = "zoom"
-
-    # ------------------------------------------------------------------
     # Persistencia
     # ------------------------------------------------------------------
     def to_dict(self) -> dict:
         return {
             "mode": self.config.mode,
             "active_region": list(self.config.active_region),
-            "corners_camera": self.config.corners_camera,
             "sensitivity": self.config.sensitivity,
             "invert_y": self.config.invert_y,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "VirtualMapper":
+        # Sesiones viejas pueden traer "zoom" o "calibrated" — ya no
+        # existen, todo se trata como adaptive.
+        mode = d.get("mode", "adaptive")
+        if mode not in ("identity", "adaptive"):
+            mode = "adaptive"
         cfg = MapperConfig(
-            mode=d.get("mode", "identity"),
+            mode=mode,
             active_region=tuple(d.get("active_region", (0.0, 0.0, 1.0, 1.0))),
-            corners_camera=d.get("corners_camera"),
             sensitivity=float(d.get("sensitivity", 1.0)),
             invert_y=bool(d.get("invert_y", False)),
         )
@@ -222,28 +190,14 @@ class VirtualMapper:
         h = max(1e-6, y1 - y0)
         return (x - x0) / w, (y - y0) / h
 
-    def _map_homography(self, x: float, y: float) -> Tuple[float, float]:
-        if self._homography is None:
-            return x, y
-        pt = np.array([[x, y, 1.0]]).T
-        out = self._homography @ pt
-        out /= out[2, 0]
-        return float(out[0, 0]), float(out[1, 0])
-
-    def _build_homography(self) -> None:
-        import cv2
-        src = np.array(self.config.corners_camera, dtype=np.float32)
-        dst = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
-        self._homography, _ = cv2.findHomography(src, dst)
-
 
 # ----------------------------------------------------------------------
 # Demo: test básico
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    m = VirtualMapper()
+    m = VirtualMapper(MapperConfig(mode="identity"))
     print("identity:", m.map_point(0.3, 0.7))
-    m2 = VirtualMapper(MapperConfig(mode="zoom", active_region=(0.2, 0.2, 0.8, 0.8)))
-    print("zoom:    ", m2.map_point(0.5, 0.5))   # centro → centro
-    print("zoom:    ", m2.map_point(0.2, 0.2))   # esquina → (0, 0)
-    print("zoom:    ", m2.map_point(0.8, 0.8))   # esquina → (1, 1)
+    m2 = VirtualMapper(MapperConfig(mode="adaptive"))
+    print("adaptive (centro):", m2.map_point(0.5, 0.5))
+    m2.update_from_hand_span(0.20)  # mano cerca
+    print("adaptive cerca (centro):", m2.map_point(0.5, 0.5))

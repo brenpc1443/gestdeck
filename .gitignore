@@ -137,3 +137,5 @@ prodeep/
 training/dataset/*/
 *.keras
 
+# ---- Caché local de Google Drive (generado por la celda de sincronización) ----
+training/.gdrive_cache/

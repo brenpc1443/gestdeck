@@ -137,3 +137,8 @@ prodeep/
 training/dataset/*/
 *.keras
 
+# ---- Videos de prueba ----
+prueba/*.mp4
+prueba/*.avi
+prueba/*.mov
+prueba/*.mkv

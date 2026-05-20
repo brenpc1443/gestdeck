@@ -142,3 +142,6 @@ prueba/*.mp4
 prueba/*.avi
 prueba/*.mov
 prueba/*.mkv
+
+# ---- Caché local de Google Drive (generado por la celda de sincronización) ----
+training/.gdrive_cache/
